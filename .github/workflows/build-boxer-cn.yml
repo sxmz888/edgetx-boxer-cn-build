@@ -1,0 +1,83 @@
+name: Build EdgeTX Boxer CN firmware
+
+# 用法：把本文件放到任意新建的空 GitHub 仓库的 .github/workflows/ 下
+# 然后 Actions -> Build EdgeTX Boxer CN firmware -> Run workflow
+# 全流程在 GitHub 云端完成，本机只需下载约 2.6 MB 的产物
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout GX12 CN fork (with 5 submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: zjm54321/edgetx-gx12-cn
+          ref: gx12-cn-ark10
+          submodules: recursive
+          fetch-depth: 1
+          path: src
+
+      - name: Replace 5 CMake conditions GX12 -> BOXER
+        working-directory: src
+        run: |
+          OLD='PCBREV STREQUAL GX12 AND TRANSLATIONS STREQUAL CN'
+          NEW='PCBREV STREQUAL BOXER AND TRANSLATIONS STREQUAL CN'
+          BEFORE=$(grep -R --include=CMakeLists.txt -F "$OLD" radio/src | wc -l)
+          echo "替换前 GX12 条件数：$BEFORE"
+          test "$BEFORE" -eq 5
+          grep -Rl --include=CMakeLists.txt -F "$OLD" radio/src | xargs sed -i "s/$OLD/$NEW/g"
+          AFTER=$(grep -R --include=CMakeLists.txt -F "$NEW" radio/src | wc -l)
+          echo "替换后 BOXER 条件数：$AFTER"
+          test "$AFTER" -eq 5
+          test "$(grep -R --include=CMakeLists.txt -F "$OLD" radio/src | wc -l)" -eq 0
+
+      - name: Build firmware inside official 2.12 container
+        working-directory: src
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=4 \
+            ghcr.io/edgetx/edgetx-dev:2.12 \
+            bash -c "set -e; cmake -S . -B build-output -Wno-dev -DPCB=X7 -DPCBREV=BOXER -DTRANSLATIONS=CN -DCMAKE_BUILD_TYPE=Release -DDEBUG=OFF; cmake --build build-output --target firmware --parallel; test -s build-output/arm-none-eabi/firmware.bin; ls -l build-output/arm-none-eabi/firmware.bin"
+
+      - name: Verify no flash overflow and sane size
+        working-directory: src
+        run: |
+          SIZE=$(stat -c %s build-output/arm-none-eabi/firmware.bin)
+          echo "firmware.bin = $SIZE bytes"
+          test "$SIZE" -gt 500000
+          test "$SIZE" -lt 700000
+          SIZE_KB=$((SIZE / 1024))
+          echo "### 编译结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 固件大小：$SIZE bytes ($SIZE_KB KB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- BOXER 条件数：5" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch verified CN font from upstream release
+        run: |
+          curl -fsSL -o /tmp/cn-release.zip \
+            https://github.com/zjm54321/edgetx-gx12-cn/releases/download/v2.12.2-cn/EdgeTX-GX12-CN-v2.12.2-cn-release.zip
+          python3 -c "import zipfile; z=zipfile.ZipFile('/tmp/cn-release.zip'); open('CN_BASIC.FNT','wb').write(z.read('CN_BASIC.FNT'))"
+          echo 'C7D01736D365736DB04AEFD1FC103DB0FC9BAAA84841C058B0CE23828F894A79  CN_BASIC.FNT' | sha256sum -c -
+
+      - name: Package artifacts
+        run: |
+          mkdir -p out
+          cp src/build-output/arm-none-eabi/firmware.bin out/EdgeTX-BOXER-CN-v2.12.2.bin
+          cp CN_BASIC.FNT out/CN_BASIC.FNT
+          cd out
+          sha256sum EdgeTX-BOXER-CN-v2.12.2.bin CN_BASIC.FNT > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload firmware bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: EdgeTX-BOXER-CN-v2.12.2
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
